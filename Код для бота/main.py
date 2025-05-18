@@ -30,6 +30,8 @@ from langchain_community.document_loaders import Docx2txtLoader
 from langgraph.graph import MessagesState, StateGraph
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from aiogram.enums.chat_action import ChatAction
+
 # Устанавливаем ключ для Mistral
 os.environ["MISTRAL_API_KEY"] = "P7iqQ5XB1wO8I06B3UYERuc5GNLCwWk6"
 llm = ChatMistralAI(model="mistral-small-latest")
@@ -195,35 +197,33 @@ async def start_story(message: Message, state: FSMContext):
     user_id = message.from_user.id
     try:
         if message.text == "✨ Начать квест ✅":
+            # Удаляем предыдущие записи
             with sqlite3.connect("users_data.db") as conn:
                 cursor = conn.cursor()
-
-                # Удаляем предыдущие записи
                 cursor.execute(
                     "DELETE FROM user_progress WHERE user_id = ?", (user_id,)
                 )
+                conn.commit()
 
-                # Генерируем новый идентификатор сессии
-                new_thread_id = f"{message.chat.id}_{int(time.time())}"
-
-                # Вставляем новую запись с начальными значениями
+            # Генерируем новый идентификатор сессии и создаём запись
+            new_thread_id = f"{message.chat.id}_{int(time.time())}"
+            with sqlite3.connect("users_data.db") as conn:
+                cursor = conn.cursor()
                 cursor.execute(
                     "INSERT INTO user_progress (user_id, progress, story, thread_id) VALUES (?, ?, ?, ?)",
                     (user_id, 1, json.dumps([]), new_thread_id),
                 )
                 conn.commit()
 
-                # Обновляем состояние
-                await state.update_data(
-                    thread_id=new_thread_id, progress=1, story=json.dumps([])
-                )
-                await state.set_state(Reg.dialog)
+            # Обновляем FSM
+            await state.update_data(
+                thread_id=new_thread_id, progress=1, story=json.dumps([])
+            )
+            await state.set_state(Reg.dialog)
 
-                # Логируем успешный старт
-                logging.info(f"New game started for user {user_id}")
+            # Запускаем первый шаг диалога
+            await handle_dialog(message, state)
 
-                # Отправляем первое сообщение
-                await handle_dialog(message, state)
 
         elif message.text == "📜 Продолжить ▶️":
             with sqlite3.connect("users_data.db") as conn:
@@ -281,11 +281,13 @@ async def handle_dialog(message: Message, state: FSMContext):
     global retriever, bot
     user_id = message.from_user.id
     data = await state.get_data()
+
+    # Если ждём пользовательский ввод
     if data.get("awaiting_custom_input"):
+        await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
         await state.update_data(awaiting_custom_input=False)
-        # Обрабатываем как обычное сообщение с введенным текстом
         fake_message = Message(
-            text=message.text,  # Используем введенный текст как есть
+            text=message.text,
             from_user=message.from_user,
             chat=message.chat,
             message_id=message.message_id,
@@ -294,6 +296,7 @@ async def handle_dialog(message: Message, state: FSMContext):
         )
         await handle_dialog(fake_message, state)
         return
+
     try:
         data = await state.get_data()
         thread_id = data.get("thread_id", str(message.chat.id))
@@ -340,6 +343,12 @@ async def handle_dialog(message: Message, state: FSMContext):
 
             # Отправляем запрос к модели
             try:
+
+                gen_msg = await bot.send_message(
+                    message.chat.id,
+                    "🔄 Генерация сюжета..."
+                )
+
                 config = {
                     "configurable": {
                         "thread_id": thread_id,
@@ -348,6 +357,12 @@ async def handle_dialog(message: Message, state: FSMContext):
                 }
                 results = app.invoke({"messages": langchain_messages}, config)
                 assistant_response = results["messages"][-1].content
+
+                await bot.delete_message(
+                    chat_id=message.chat.id,
+                    message_id=gen_msg.message_id
+                )
+
 
                 # Добавляем ответ ассистента в историю
                 messages_history.append(
@@ -474,9 +489,8 @@ async def process_option(callback: types.CallbackQuery, state: FSMContext):
             chat=callback.message.chat,
             message_id=callback.message.message_id,
             date=callback.message.date,
-            bot=bot,  # Важно добавить эту строку
+            bot=bot,
         )
-
         await handle_dialog(fake_message, state)
 
     except Exception as e:
